@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Ultra Monitor 1000</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 10px;
+        }
+        .dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; }
+    </style>
+</head>
+<body class="bg-[#0d1117] text-gray-300 p-5">
+
+    <div class="flex justify-between items-center border-b border-gray-700 pb-4 mb-6">
+        <h1 class="text-2xl font-bold text-white">📡 Monitor Masivo <span id="count" class="text-blue-500">0</span> Sites</h1>
+        <div class="flex gap-4">
+            <input type="text" id="search" placeholder="Buscar sitio..." class="bg-gray-800 border border-gray-700 rounded px-3 py-1">
+            <button onclick="startMonitor()" id="btnAction" class="bg-green-600 hover:bg-green-700 text-white px-5 py-1 rounded font-bold">▶ INICIAR</button>
+        </div>
+    </div>
+
+    <div id="summary" class="mb-6 p-4 bg-red-900/20 border border-red-900/50 rounded-lg hidden">
+        <h2 class="text-red-500 font-bold mb-2">⚠️ SUCURSALES FUERA DE LÍNEA:</h2>
+        <div id="down-list" class="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4"></div>
+    </div>
+
+    <div class="mb-4 text-xs font-bold uppercase text-gray-500">Mapa de Estado General:</div>
+    <div id="visual-map" class="status-grid bg-gray-900/50 p-4 rounded-lg"></div>
+
+    <script>
+        let sites = [];
+        let isRunning = false;
+
+        // 1. Cargar los 1000 sitios desde el JSON
+        async function loadData() {
+            try {
+                const response = await fetch('data.json');
+                sites = await response.json();
+                document.getElementById('count').innerText = sites.length;
+                renderMap();
+            } catch (e) {
+                console.error("Error cargando data.json. Asegúrate de que el archivo exista.");
+                alert("Error: Crea un archivo data.json en la misma carpeta.");
+            }
+        }
+
+        // 2. Renderizar el mapa visual inicial
+        function renderMap() {
+            const map = document.getElementById('visual-map');
+            map.innerHTML = sites.map((s, i) => `
+                <div id="node-${i}" class="text-[10px] bg-gray-800 p-2 rounded border border-gray-700 flex items-center gap-2">
+                    <span id="dot-${i}" class="dot bg-gray-600"></span>
+                    <span class="truncate">${s.n}</span>
+                </div>
+            `).join('');
+        }
+
+        // 3. Lógica de Monitoreo Masivo
+        async function startMonitor() {
+            if(isRunning) return location.reload();
+            isRunning = true;
+            document.getElementById('btnAction').innerText = "🛑 REINICIAR";
+            document.getElementById('btnAction').classList.replace('bg-green-600', 'bg-red-600');
+            
+            while(isRunning) {
+                const batchSize = 50; // Procesar de 50 en 50 para no bloquear
+                for (let i = 0; i < sites.length; i += batchSize) {
+                    const batch = sites.slice(i, i + batchSize);
+                    await Promise.all(batch.map((site, index) => checkSite(site, i + index)));
+                }
+                await new Promise(r => setTimeout(r, 30000)); // Esperar 30s para el siguiente ciclo
+            }
+        }
+
+        async function checkSite(site, globalIndex) {
+            const dot = document.getElementById(`dot-${globalIndex}`);
+            const node = document.getElementById(`node-${globalIndex}`);
+            
+            try {
+                // Simulación de check (En red local usar fetch con timeout)
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000);
+                
+                const res = await fetch(`http://${site.ip}`, { mode: 'no-cors', signal: controller.signal });
+                
+                dot.className = "dot bg-green-500 shadow-[0_0_5px_#22c55e]";
+                node.classList.remove('border-red-500', 'bg-red-900/20');
+            } catch (e) {
+                dot.className = "dot bg-red-500 shadow-[0_0_5px_#ef4444]";
+                node.classList.add('border-red-500', 'bg-red-900/20');
+                updateDownSummary(site, globalIndex);
+            }
+        }
+
+        function updateDownSummary(site, index) {
+            const container = document.getElementById('summary');
+            const list = document.getElementById('down-list');
+            container.classList.remove('hidden');
+            
+            if (!document.getElementById(`card-down-${index}`)) {
+                const baseIp = site.ip.split('.').slice(0,3).join('.');
+                list.innerHTML += `
+                    <div id="card-down-${index}" class="bg-gray-900 border border-red-500 p-3 rounded shadow-lg">
+                        <div class="text-red-500 font-bold underline mb-1">${site.n}</div>
+                        <div class="text-[10px] space-y-1">
+                            <p>IP .20: ${site.ip}</p>
+                            <a href="http://${baseIp}.22" target="_blank" class="block bg-blue-600 text-center rounded py-1 mt-2 text-white font-bold">VIRTUAL (.22)</a>
+                            <a href="https://${baseIp}.21" target="_blank" class="block bg-orange-600 text-center rounded py-1 text-white font-bold">iLO (.21)</a>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        // Buscador
+        document.getElementById('search').addEventListener('input', (e) => {
+            const val = e.target.value.toUpperCase();
+            sites.forEach((s, i) => {
+                const el = document.getElementById(`node-${i}`);
+                el.style.display = s.n.includes(val) || s.ip.includes(val) ? 'flex' : 'none';
+            });
+        });
+
+        window.onload = loadData;
+    </script>
+</body>
+</html>
