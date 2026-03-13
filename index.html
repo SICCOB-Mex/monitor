@@ -2,14 +2,13 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <title>Monitor Crítico - SICCOB</title>
+    <title>Monitor IT - Real Time</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         .status-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
         .dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; transition: all 0.3s; }
         .tab-active { border-bottom: 3px solid #3b82f6; color: #3b82f6; font-weight: bold; }
-        .diagnostic-card { border-left: 4px solid #ef4444; background: #161b22; }
-        #timer-display { font-variant-numeric: tabular-nums; }
+        .diagnostic-card { border-left: 4px solid #ef4444; background: #161b22; transition: all 0.3s; }
     </style>
 </head>
 <body class="bg-[#0b0e14] text-gray-300 p-6">
@@ -17,11 +16,11 @@
     <div class="flex justify-between items-center border-b border-gray-800 pb-5 mb-6">
         <div>
             <h1 class="text-2xl font-bold text-white tracking-tight">📟 Monitor de Infraestructura</h1>
-            <p class="text-xs text-gray-500 mt-1">Siguiente validación en: <span id="timer-display" class="text-blue-400 font-bold">01:00</span></p>
+            <p class="text-xs text-gray-500 mt-1">Siguiente ciclo en: <span id="timer-display" class="text-blue-400 font-bold">01:00</span></p>
         </div>
         <div class="flex gap-4 text-sm">
-            <input type="text" id="search" placeholder="🔍 Buscar sitio..." class="bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500 outline-none w-64">
-            <button onclick="startMonitor()" id="btnAction" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-bold transition-all shadow-lg">▶ INICIAR</button>
+            <input type="text" id="search" placeholder="🔍 Buscar sitio o IP..." class="bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500 outline-none w-64">
+            <button onclick="startMonitor()" id="btnAction" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-bold shadow-lg">▶ INICIAR</button>
         </div>
     </div>
 
@@ -38,27 +37,36 @@
     <script>
         let sites = [];
         let isRunning = false;
-        let currentTab = 'all';
         let countdown = 60;
         let timerId = null;
 
-        // Carga de datos desde la lista proporcionada 
-        async function loadData() {
-            const localData = localStorage.getItem('monitor_v4_data');
-            if (localData) {
-                sites = JSON.parse(localData);
-            } else {
-                try {
-                    const response = await fetch('data.json');
-                    sites = await response.json();
-                    save();
-                } catch(e) { sites = []; }
-            }
+        // Base de datos integrada con los sitios del archivo [cite: 1, 2, 3]
+        const rawData = [
+            {"n":"AGUASCALIENTES","ip":"10.100.179.20","f":"10.100.179.1"},
+            {"n":"ALAIA","ip":"10.101.87.20","f":"10.101.87.1"},
+            {"n":"ALAIA TAPACHULA","ip":"10.100.155.20","f":"10.100.155.1"},
+            {"n":"ALTABRISA VILLAHERMOSA","ip":"10.100.10.20","f":"10.100.10.1"},
+            {"n":"ALTAVISTA","ip":"10.100.96.20","f":"10.100.96.1"},
+            {"n":"AMALUCAN","ip":"10.101.97.20","f":"10.101.97.1"},
+            {"n":"ANTARA","ip":"10.100.165.20","f":"10.100.165.1"},
+            {"n":"ARTZ PEDREGAL","ip":"10.100.71.20","f":"10.100.71.1"},
+            {"n":"BOULEVARES QUERETARO","ip":"10.100.184.20","f":"10.100.184.1"},
+            {"n":"CUAUTITLAN","ip":"10.100.21.20","f":"10.100.21.1"},
+            {"n":"DURANGO","ip":"10.100.211.20","f":"10.100.211.1"},
+            {"n":"MUNDO E","ip":"10.100.153.20","f":"10.100.153.1"},
+            {"n":"PARQUE DELTA","ip":"10.100.110.20","f":"10.100.110.1"},
+            {"n":"REFORMA 222","ip":"10.100.164.20","f":"10.100.164.1"},
+            {"n":"SANTA FE","ip":"10.100.77.20","f":"10.100.77.1"},
+            {"n":"TOWNSQUARE METEPEC","ip":"10.100.126.20","f":"10.100.126.1"}
+            // Aquí puedes pegar el resto de tu JSON [cite: 1, 2, 3]
+        ];
+
+        function loadData() {
+            const local = localStorage.getItem('monitor_v5');
+            sites = local ? JSON.parse(local) : rawData.map(s => ({...s, status: 'unknown'}));
             updateCounters();
             render();
         }
-
-        function save() { localStorage.setItem('monitor_v4_data', JSON.stringify(sites)); }
 
         async function startMonitor() {
             if(isRunning) return location.reload();
@@ -69,54 +77,58 @@
         }
 
         async function runCycle() {
-            if(!isRunning) return;
-            
-            // Lógica de Escaneo en Cascada por Lotes
-            const batchSize = 25;
+            const batchSize = 15;
             for (let i = 0; i < sites.length; i += batchSize) {
                 const batch = sites.slice(i, i + batchSize);
-                await Promise.all(batch.map((site, index) => checkCascaded(site, i + index)));
+                await Promise.all(batch.map((site, index) => cascadedCheck(site, i + index)));
+                render(); 
             }
-
             updateCounters();
-            render();
             resetTimer();
         }
 
-        async function checkCascaded(site, index) {
-            // 1. Validar Fortinet (.1) según lista 
-            const fortiOk = await ping(site.f);
+        // MÉTODO DE PING FUNCIONAL PARA NAVEGADOR
+        function webPing(ip) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                const timer = setTimeout(() => {
+                    img.src = "";
+                    resolve(false);
+                }, 1800); // Timeout de 1.8 segundos
+
+                img.onload = () => { clearTimeout(timer); resolve(true); };
+                img.onerror = () => { clearTimeout(timer); resolve(true); }; // Error significa que el host respondió (CORS)
+                img.src = `http://${ip}/favicon.ico?d=${Date.now()}`;
+            });
+        }
+
+        async function cascadedCheck(site, index) {
+            // 1. Validar Fortinet (.1) 
+            const fortiOk = await webPing(site.f);
             if (!fortiOk) {
                 sites[index].status = 'offline';
                 sites[index].diag = 'critical';
                 return;
             }
 
-            // 2. Validar Servidor Principal (.20/.30) 
-            const serverOk = await ping(site.ip);
+            // 2. Validar Servidor (.20/.30) 
+            const serverOk = await webPing(site.ip);
             if (serverOk) {
                 sites[index].status = 'online';
                 sites[index].diag = 'ok';
                 return;
             }
 
-            // 3. Ping Extendido (iLO .21 y Virtual .22)
+            // 3. Ping Extendido (.21 y .22)
             sites[index].status = 'offline';
             const base = site.ip.split('.').slice(0,3).join('.');
-            const [ilo, virt] = await Promise.all([ping(`${base}.21`), ping(`${base}.22`)]);
+            const [ilo, virt] = await Promise.all([webPing(`${base}.21`), webPing(`${base}.22`)]);
             
             sites[index].ilo_ok = ilo;
             sites[index].virt_ok = virt;
+            sites[index].v_ip = `${base}.22`;
+            sites[index].i_ip = `${base}.21`;
             sites[index].diag = (ilo || virt) ? 'reachable' : 'dead';
-        }
-
-        async function ping(ip) {
-            try {
-                const ctrl = new AbortController();
-                const timeout = setTimeout(() => ctrl.abort(), 2000);
-                await fetch(`http://${ip}`, { mode: 'no-cors', signal: ctrl.signal });
-                return true;
-            } catch { return false; }
         }
 
         function resetTimer() {
@@ -124,9 +136,7 @@
             if(timerId) clearInterval(timerId);
             timerId = setInterval(() => {
                 countdown--;
-                const mins = String(Math.floor(countdown / 60)).padStart(2, '0');
-                const secs = String(countdown % 60).padStart(2, '0');
-                document.getElementById('timer-display').innerText = `${mins}:${secs}`;
+                document.getElementById('timer-display').innerText = `00:${String(countdown).padStart(2, '0')}`;
                 if(countdown <= 0) runCycle();
             }, 1000);
         }
@@ -135,36 +145,37 @@
             const search = document.getElementById('search').value.toUpperCase();
             const filtered = sites.filter(s => s.n.includes(search) || s.ip.includes(search));
 
-            // Render Vista Caídos con Notas de Recordatorio
+            // CRÍTICOS
             document.getElementById('map-offline').innerHTML = filtered.filter(s => s.status === 'offline').map(s => {
                 let note = "", buttons = "";
-                const base = s.ip.split('.').slice(0,3).join('.');
-
                 if (s.diag === 'critical') {
-                    note = `<div class="bg-red-900/40 p-2 rounded border border-red-500/50 text-[10px] text-red-200 mt-2">❗ SOLICITAR VALIDAR CON EL COMPLEJO (Todo Offline)</div>`;
+                    note = `<div class="bg-red-900/40 p-2 rounded border border-red-500/50 text-[10px] text-red-200 mt-2 font-bold">❗ SOLICITAR VALIDAR CON EL COMPLEJO (Todo Offline)</div>`;
                 } else if (s.diag === 'reachable') {
-                    note = `<div class="bg-yellow-900/40 p-2 rounded border border-yellow-500/50 text-[10px] text-yellow-200 mt-2">💡 ENCENDER POR MÁQUINA VIRTUAL O ILO</div>`;
-                    if(s.virt_ok) buttons += `<a href="http://${base}.22" target="_blank" class="bg-blue-600 text-center py-1 rounded text-white font-bold">VIRTUAL</a>`;
-                    if(s.ilo_ok) buttons += `<a href="https://${base}.21" target="_blank" class="bg-orange-600 text-center py-1 rounded text-white font-bold">iLO</a>`;
+                    note = `<div class="bg-yellow-900/40 p-2 rounded border border-yellow-500/50 text-[10px] text-yellow-200 mt-2 font-bold">💡 ENCENDER POR MÁQUINA VIRTUAL O ILO</div>`;
+                    if(s.virt_ok) buttons += `<a href="http://${s.v_ip}" target="_blank" class="bg-blue-600 text-center py-1 rounded text-white font-bold hover:bg-blue-500 transition">VIRTUAL</a>`;
+                    if(s.ilo_ok) buttons += `<a href="https://${s.i_ip}" target="_blank" class="bg-orange-600 text-center py-1 rounded text-white font-bold hover:bg-orange-500 transition">iLO</a>`;
+                } else {
+                    note = `<div class="bg-gray-800 p-2 rounded border border-gray-600 text-[10px] text-gray-400 mt-2 italic">Sin respuesta de servicios auxiliares.</div>`;
                 }
 
                 return `
                 <div class="diagnostic-card p-4 rounded-lg shadow-xl">
                     <div class="flex justify-between font-bold text-red-500 text-xs mb-2"><span>${s.n}</span></div>
-                    <p class="text-[10px] text-gray-500">IP: ${s.ip} | Forti: ${s.f}</p>
+                    <p class="text-[10px] text-gray-500 font-mono italic">IP: ${s.ip} | Forti: ${s.f}</p>
                     ${note}
                     <div class="grid grid-cols-2 gap-2 mt-3">${buttons}</div>
                 </div>`;
             }).join('');
 
-            // Render All & Online
+            // TODOS
             document.getElementById('map-all').innerHTML = filtered.map(s => `
                 <div class="bg-gray-900/50 p-2 rounded border border-gray-800 flex items-center gap-2 text-[10px]">
-                    <span class="dot ${s.status === 'online' ? 'bg-green-500' : s.status === 'offline' ? 'bg-red-500' : 'bg-gray-600'}"></span>
+                    <span class="dot ${s.status === 'online' ? 'bg-green-500 shadow-[0_0_5px_green]' : s.status === 'offline' ? 'bg-red-500 shadow-[0_0_5px_red]' : 'bg-gray-600'}"></span>
                     <span class="truncate">${s.n}</span>
                 </div>
             `).join('');
 
+            // ONLINE
             document.getElementById('map-online').innerHTML = filtered.filter(s => s.status === 'online').map(s => `
                 <div class="bg-green-900/10 p-2 rounded border border-green-900/20 flex items-center gap-2 text-[10px]">
                     <span class="dot bg-green-500"></span>
@@ -174,18 +185,10 @@
         }
 
         function switchTab(tab) {
-            currentTab = tab;
             document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
             document.querySelectorAll('button[id^="tab-"]').forEach(b => b.classList.remove('tab-active', 'text-gray-300'));
             document.getElementById(`view-${tab}`).classList.remove('hidden');
             document.getElementById(`tab-${tab}`).classList.add('tab-active');
-            render();
-        }
-
-        function updateCounters() {
-            document.getElementById('count-all').innerText = sites.length;
-            document.getElementById('count-online').innerText = sites.filter(s => s.status === 'online').length;
-            document.getElementById('count-offline').innerText = sites.filter(s => s.status === 'offline').length;
         }
 
         document.getElementById('search').addEventListener('input', render);
