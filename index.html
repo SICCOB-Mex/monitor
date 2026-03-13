@@ -2,10 +2,10 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <title>Monitor IT - SICCOB</title>
+    <title>Monitor IT - Tiempo Real & Downtime</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        .status-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+        .status-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
         .dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; transition: background 0.5s; }
         .tab-active { border-bottom: 3px solid #3b82f6; color: #3b82f6; font-weight: bold; }
         .card-critica { border-left: 4px solid #ef4444; background: #161b22; }
@@ -15,8 +15,8 @@
 
     <div class="flex justify-between items-center border-b border-gray-800 pb-5 mb-6">
         <div>
-            <h1 class="text-2xl font-bold text-white tracking-tight">📡 Monitor de Infraestructura Masivo</h1>
-            <p class="text-xs text-gray-500 mt-1 italic">Extrayendo datos de data.json | Refresco: 1 min</p>
+            <h1 class="text-2xl font-bold text-white tracking-tight">📡 Monitor de Red Masivo</h1>
+            <p class="text-xs text-gray-500 mt-1 italic">Ciclo: 1 min | Rastreo de Downtime Activo</p>
         </div>
         <div class="flex gap-4">
             <span id="timer-box" class="bg-gray-900 px-4 py-2 rounded border border-gray-700 text-blue-400 font-mono self-center">01:00</span>
@@ -41,88 +41,102 @@
         let countdown = 60;
         let timerInterval = null;
 
-        // 1. CARGA DE DATOS DESDE DATA.JSON
+        // 1. CARGA DE DATOS (Maneja persistencia de downtime)
         async function loadSites() {
             try {
-                const response = await fetch('data.json'); [cite: 3]
-                const data = await response.json(); [cite: 3]
+                const response = await fetch('data.json');
+                const data = await response.json();
                 sites = data.map(s => ({
-                    n: s.n.toUpperCase(), [cite: 3]
-                    ip: s.ip, // IP Principal (.20/.30) 
-                    f: s.f,   // Fortinet (.1) 
+                    n: s.n.toUpperCase(),
+                    ip: s.ip,
+                    f: s.f,
                     status: 'unknown',
-                    diag: 'none'
+                    diag: 'none',
+                    offlineSince: null // Marca de tiempo cuando cae
                 }));
                 updateCounters();
                 render();
             } catch (e) {
-                alert("Error: Asegúrate de que 'data.json' existe y que estás ejecutando esto en un servidor (Live Server).");
+                console.error("Error cargando data.json");
             }
         }
 
-        // 2. MOTOR DE ESCANEO REAL (Image Probe Technique)
-        // Esta técnica evita el bloqueo de CORS al detectar errores de red como señal de vida
+        // 2. MOTOR DE ESCANEO (Técnica no-cors para saltar bloqueos de seguridad)
         function probeIP(ip) {
             return new Promise((resolve) => {
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => {
                     controller.abort();
-                    resolve(false); // Tiempo agotado = Offline
-                }, 2000);
+                    resolve(false);
+                }, 2500);
 
-                // Intentamos cargar un recurso inexistente para forzar una respuesta de red
-                fetch(`http://${ip}/ping_test_ignore`, { mode: 'no-cors', signal: controller.signal })
-                    .then(() => { clearTimeout(timeoutId); resolve(true); }) // Respuesta recibida (incluso error 404) = Online
+                fetch(`http://${ip}/probe_${Date.now()}`, { mode: 'no-cors', signal: controller.signal })
+                    .then(() => { clearTimeout(timeoutId); resolve(true); })
                     .catch((err) => { 
                         clearTimeout(timeoutId);
-                        // Si el error es de red (no de aborto), el host suele estar vivo pero rechaza la conexión
+                        // En la mayoría de los casos de Intranet, si no es AbortError, el host está vivo
                         resolve(err.name !== 'AbortError'); 
                     });
             });
         }
 
-        // 3. LÓGICA DE ESCANEO EN CASCADA
+        // 3. LÓGICA DE ESCANEO EN CASCADA Y TIEMPO
         async function runScan() {
             if (!isRunning) return;
             
-            const batchSize = 10; // Lotes pequeños para estabilidad en redes masivas
+            const batchSize = 12;
             for (let i = 0; i < sites.length; i += batchSize) {
                 const batch = sites.slice(i, i + batchSize);
                 await Promise.all(batch.map(async (site, idx) => {
-                    const globalIdx = i + idx;
-                    
-                    // Paso 1: Validar Enlace Fortinet (.1)
+                    const gIdx = i + idx;
                     const fortiOk = await probeIP(site.f);
+                    
                     if (!fortiOk) {
-                        sites[globalIdx].status = 'offline';
-                        sites[globalIdx].diag = 'CRITICAL';
+                        setOffline(gIdx, 'CRITICAL');
                         return;
                     }
 
-                    // Paso 2: Validar Servidor Principal
                     const serverOk = await probeIP(site.ip);
                     if (serverOk) {
-                        sites[globalIdx].status = 'online';
-                        sites[globalIdx].diag = 'OK';
+                        sites[gIdx].status = 'online';
+                        sites[gIdx].offlineSince = null; // Reset al volver a estar online
+                        sites[gIdx].diag = 'OK';
                         return;
                     }
 
-                    // Paso 3: Servidor Caído pero Fortinet vivo -> Validar Auxiliares
-                    sites[globalIdx].status = 'offline';
+                    // Servidor caído, pero forti vivo -> Escaneo extendido
+                    setOffline(gIdx, 'CHECKING');
                     const base = site.ip.split('.').slice(0,3).join('.');
                     const [ilo, virt] = await Promise.all([probeIP(`${base}.21`), probeIP(`${base}.22`)]);
                     
-                    sites[globalIdx].ilo_ok = ilo;
-                    sites[globalIdx].virt_ok = virt;
-                    sites[globalIdx].diag = (ilo || virt) ? 'REACHABLE' : 'DEAD';
+                    sites[gIdx].ilo_ok = ilo;
+                    sites[gIdx].virt_ok = virt;
+                    sites[gIdx].diag = (ilo || virt) ? 'REACHABLE' : 'DEAD';
                 }));
-                render(); // Actualización visual progresiva
+                render(); 
             }
             updateCounters();
             startTimer();
         }
 
-        // 4. INTERFAZ Y CONTROL
+        function setOffline(index, diagnostic) {
+            sites[index].status = 'offline';
+            sites[index].diag = diagnostic;
+            // Si es la primera vez que se detecta caído, guardamos la hora
+            if (!sites[index].offlineSince) {
+                sites[index].offlineSince = Date.now();
+            }
+        }
+
+        function getDowntime(since) {
+            if (!since) return "";
+            const diff = Math.floor((Date.now() - since) / 1000);
+            const m = Math.floor(diff / 60);
+            const s = diff % 60;
+            return `${m}m ${s}s`;
+        }
+
+        // 4. INTERFAZ
         function toggleMonitor() {
             if (isRunning) { location.reload(); return; }
             isRunning = true;
@@ -148,45 +162,49 @@
             const search = document.getElementById('search').value.toUpperCase();
             const filtered = sites.filter(s => s.n.includes(search) || s.ip.includes(search));
 
-            // TAB: TODOS
-            document.getElementById('map-all').innerHTML = filtered.map(s => `
-                <div class="bg-gray-900/50 p-2 rounded border border-gray-800 flex items-center gap-2 text-[10px]">
-                    <span class="dot ${s.status === 'online' ? 'bg-green-500 shadow-[0_0_5px_green]' : s.status === 'offline' ? 'bg-red-500 shadow-[0_0_5px_red]' : 'bg-gray-600'}"></span>
-                    <span class="truncate">${s.n}</span>
-                </div>
-            `).join('');
-
-            // TAB: ONLINE
-            document.getElementById('map-online').innerHTML = filtered.filter(s => s.status === 'online').map(s => `
-                <div class="bg-green-900/10 p-2 rounded border border-green-900/20 flex items-center gap-2 text-[10px]">
-                    <span class="dot bg-green-500"></span>
-                    <span class="truncate text-green-400 font-bold">${s.n}</span>
-                </div>
-            `).join('');
-
-            // TAB: CAÍDOS (CON NOTAS TÉCNICAS)
+            // TAB: CAÍDOS
             document.getElementById('map-offline').innerHTML = filtered.filter(s => s.status === 'offline').map(s => {
                 let note = "", buttons = "";
                 const base = s.ip.split('.').slice(0,3).join('.');
+                const timeStr = getDowntime(s.offlineSince);
 
                 if (s.diag === 'CRITICAL') {
-                    note = `<div class="bg-red-900/30 p-2 rounded border border-red-500/50 text-[10px] text-red-200 mt-2 font-bold uppercase text-center">solicitar validar con el complejo</div>`;
+                    note = `<div class="bg-red-900/30 p-2 rounded border border-red-500/50 text-[10px] text-red-200 mt-2 font-bold uppercase text-center">SOLICITAR VALIDAR CON EL COMPLEJO</div>`;
                 } else if (s.diag === 'REACHABLE') {
-                    note = `<div class="bg-yellow-900/30 p-2 rounded border border-yellow-500/50 text-[10px] text-yellow-200 mt-2 font-bold uppercase text-center">encender por máquina virtual o ilo</div>`;
-                    if (s.virt_ok) buttons += `<a href="http://${base}.22" target="_blank" class="bg-blue-600 text-center py-1 rounded text-white font-bold text-[10px] hover:bg-blue-500 transition">VIRTUAL (.22)</a>`;
-                    if (s.ilo_ok) buttons += `<a href="https://${base}.21" target="_blank" class="bg-orange-600 text-center py-1 rounded text-white font-bold text-[10px] hover:bg-orange-500 transition">ILO (.21)</a>`;
+                    note = `<div class="bg-yellow-900/30 p-2 rounded border border-yellow-500/50 text-[10px] text-yellow-200 mt-2 font-bold uppercase text-center">ENCENDER POR MÁQUINA VIRTUAL O ILO</div>`;
+                    if (s.virt_ok) buttons += `<a href="http://${base}.22" target="_blank" class="bg-blue-600 text-center py-1 rounded text-white font-bold text-[10px]">VIRTUAL</a>`;
+                    if (s.ilo_ok) buttons += `<a href="https://${base}.21" target="_blank" class="bg-orange-600 text-center py-1 rounded text-white font-bold text-[10px]">ILO</a>`;
                 } else {
-                    note = `<div class="bg-gray-800 p-2 rounded border border-gray-600 text-[10px] text-gray-400 mt-2 italic text-center">SIN RESPUESTA DE RED DETRÁS DEL FORTINET</div>`;
+                    note = `<div class="bg-gray-800 p-2 rounded border border-gray-600 text-[10px] text-gray-400 mt-2 italic text-center">SIN RESPUESTA DE SERVICIOS</div>`;
                 }
 
                 return `
-                <div class="card-critica p-4 rounded-lg shadow-xl">
+                <div class="card-critica p-4 rounded-lg shadow-xl relative">
+                    <div class="absolute top-2 right-2 text-[9px] font-bold text-red-400 bg-red-900/20 px-2 py-0.5 rounded">Fuera hace: ${timeStr}</div>
                     <div class="flex justify-between font-bold text-red-500 text-xs mb-2 uppercase"><span>${s.n}</span></div>
                     <p class="text-[9px] text-gray-500 font-mono italic">IP: ${s.ip} | FORTI: ${s.f}</p>
                     ${note}
                     <div class="grid grid-cols-2 gap-2 mt-3">${buttons}</div>
                 </div>`;
             }).join('');
+
+            // TAB: TODOS & ONLINE
+            document.getElementById('map-all').innerHTML = filtered.map(s => `
+                <div class="bg-gray-900/50 p-2 rounded border border-gray-800 flex items-center gap-2 text-[10px]">
+                    <span class="dot ${s.status === 'online' ? 'bg-green-500' : s.status === 'offline' ? 'bg-red-500' : 'bg-gray-600'}"></span>
+                    <div class="flex flex-col">
+                        <span class="truncate">${s.n}</span>
+                        ${s.status === 'offline' ? `<span class="text-[8px] text-red-400">Offline: ${getDowntime(s.offlineSince)}</span>` : ''}
+                    </div>
+                </div>
+            `).join('');
+
+            document.getElementById('map-online').innerHTML = filtered.filter(s => s.status === 'online').map(s => `
+                <div class="bg-green-900/10 p-2 rounded border border-green-900/20 flex items-center gap-2 text-[10px]">
+                    <span class="dot bg-green-500"></span>
+                    <span class="truncate text-green-400 font-bold">${s.n}</span>
+                </div>
+            `).join('');
         }
 
         function switchTab(tab) {
