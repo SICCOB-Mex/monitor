@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <title>Monitor IT - Tiempo Real & Downtime</title>
+    <title>Monitor IT - Escaneo Masivo</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         .status-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
@@ -16,19 +16,18 @@
     <div class="flex justify-between items-center border-b border-gray-800 pb-5 mb-6">
         <div>
             <h1 class="text-2xl font-bold text-white tracking-tight">📡 Monitor de Red Masivo</h1>
-            <p class="text-xs text-gray-500 mt-1 italic">Ciclo: 1 min | Rastreo de Downtime Activo</p>
+            <p class="text-xs text-gray-500 mt-1 italic">Siguiente ciclo en: <span id="timer-box" class="text-blue-400 font-bold">01:00</span></p>
         </div>
         <div class="flex gap-4">
-            <span id="timer-box" class="bg-gray-900 px-4 py-2 rounded border border-gray-700 text-blue-400 font-mono self-center">01:00</span>
-            <input type="text" id="search" placeholder="🔍 Buscar sitio o IP..." class="bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none w-64 focus:border-blue-500 transition-all">
-            <button onclick="toggleMonitor()" id="btnAction" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-bold shadow-lg">▶ INICIAR ESCANEO</button>
+            <input type="text" id="search" placeholder="🔍 Buscar sitio..." class="bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-sm outline-none w-64 focus:border-blue-500">
+            <button onclick="toggleMonitor()" id="btnAction" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-bold shadow-lg transition-all">▶ INICIAR</button>
         </div>
     </div>
 
     <div class="flex gap-10 mb-8 border-b border-gray-800 text-sm">
-        <button onclick="switchTab('all')" id="tab-all" class="pb-3 px-2 tab-active transition-all uppercase">Todos (<span id="count-all">0</span>)</button>
-        <button onclick="switchTab('online')" id="tab-online" class="pb-3 px-2 text-gray-500 hover:text-gray-300 transition-all uppercase">Online (<span id="count-online">0</span>)</button>
-        <button onclick="switchTab('offline')" id="tab-offline" class="pb-3 px-2 text-gray-500 hover:text-gray-300 transition-all uppercase text-red-500">Caídos (<span id="count-offline">0</span>)</button>
+        <button onclick="switchTab('all')" id="tab-all" class="pb-3 px-2 tab-active transition-all">TODOS (<span id="count-all">0</span>)</button>
+        <button onclick="switchTab('online')" id="tab-online" class="pb-3 px-2 text-gray-500 hover:text-gray-300 transition-all">ONLINE (<span id="count-online">0</span>)</button>
+        <button onclick="switchTab('offline')" id="tab-offline" class="pb-3 px-2 text-gray-500 hover:text-gray-300 transition-all text-red-500">CAÍDOS (<span id="count-offline">0</span>)</button>
     </div>
 
     <div id="view-all" class="tab-content"><div id="map-all" class="status-grid"></div></div>
@@ -41,7 +40,7 @@
         let countdown = 60;
         let timerInterval = null;
 
-        // 1. CARGA DE DATOS (Maneja persistencia de downtime)
+        // 1. CARGA DE DATOS
         async function loadSites() {
             try {
                 const response = await fetch('data.json');
@@ -52,66 +51,62 @@
                     f: s.f,
                     status: 'unknown',
                     diag: 'none',
-                    offlineSince: null // Marca de tiempo cuando cae
+                    offlineSince: null
                 }));
                 updateCounters();
                 render();
             } catch (e) {
-                console.error("Error cargando data.json");
+                alert("Error: Crea el archivo 'data.json' en la misma carpeta.");
             }
         }
 
-        // 2. MOTOR DE ESCANEO (Técnica no-cors para saltar bloqueos de seguridad)
+        // 2. MÉTODO DE PING REAL (Image Probe) - SOLUCIONA EL "NO INICIA"
         function probeIP(ip) {
             return new Promise((resolve) => {
-                const controller = new AbortController();
+                const img = new Image();
                 const timeoutId = setTimeout(() => {
-                    controller.abort();
+                    img.src = "";
                     resolve(false);
-                }, 2500);
+                }, 2000); // 2 segundos de espera
 
-                fetch(`http://${ip}/probe_${Date.now()}`, { mode: 'no-cors', signal: controller.signal })
-                    .then(() => { clearTimeout(timeoutId); resolve(true); })
-                    .catch((err) => { 
-                        clearTimeout(timeoutId);
-                        // En la mayoría de los casos de Intranet, si no es AbortError, el host está vivo
-                        resolve(err.name !== 'AbortError'); 
-                    });
+                img.onload = () => { clearTimeout(timeoutId); resolve(true); };
+                img.onerror = () => { clearTimeout(timeoutId); resolve(true); }; // Error de red = Host vivo
+                img.src = `http://${ip}/probe_ref_${Date.now()}`;
             });
         }
 
-        // 3. LÓGICA DE ESCANEO EN CASCADA Y TIEMPO
+        // 3. LÓGICA DE ESCANEO
         async function runScan() {
             if (!isRunning) return;
             
-            const batchSize = 12;
+            const batchSize = 15;
             for (let i = 0; i < sites.length; i += batchSize) {
                 const batch = sites.slice(i, i + batchSize);
                 await Promise.all(batch.map(async (site, idx) => {
                     const gIdx = i + idx;
-                    const fortiOk = await probeIP(site.f);
                     
+                    // Paso 1: Fortinet (.1)
+                    const fortiOk = await probeIP(site.f);
                     if (!fortiOk) {
                         setOffline(gIdx, 'CRITICAL');
                         return;
                     }
 
+                    // Paso 2: Servidor Principal (.20/.30)
                     const serverOk = await probeIP(site.ip);
                     if (serverOk) {
                         sites[gIdx].status = 'online';
-                        sites[gIdx].offlineSince = null; // Reset al volver a estar online
+                        sites[gIdx].offlineSince = null;
                         sites[gIdx].diag = 'OK';
                         return;
                     }
 
-                    // Servidor caído, pero forti vivo -> Escaneo extendido
-                    setOffline(gIdx, 'CHECKING');
+                    // Paso 3: Escaneo Extendido
+                    setOffline(gIdx, 'REACHABLE');
                     const base = site.ip.split('.').slice(0,3).join('.');
                     const [ilo, virt] = await Promise.all([probeIP(`${base}.21`), probeIP(`${base}.22`)]);
-                    
                     sites[gIdx].ilo_ok = ilo;
                     sites[gIdx].virt_ok = virt;
-                    sites[gIdx].diag = (ilo || virt) ? 'REACHABLE' : 'DEAD';
                 }));
                 render(); 
             }
@@ -122,21 +117,15 @@
         function setOffline(index, diagnostic) {
             sites[index].status = 'offline';
             sites[index].diag = diagnostic;
-            // Si es la primera vez que se detecta caído, guardamos la hora
-            if (!sites[index].offlineSince) {
-                sites[index].offlineSince = Date.now();
-            }
+            if (!sites[index].offlineSince) sites[index].offlineSince = Date.now();
         }
 
         function getDowntime(since) {
             if (!since) return "";
             const diff = Math.floor((Date.now() - since) / 1000);
-            const m = Math.floor(diff / 60);
-            const s = diff % 60;
-            return `${m}m ${s}s`;
+            return `${Math.floor(diff / 60)}m ${diff % 60}s`;
         }
 
-        // 4. INTERFAZ
         function toggleMonitor() {
             if (isRunning) { location.reload(); return; }
             isRunning = true;
@@ -162,39 +151,31 @@
             const search = document.getElementById('search').value.toUpperCase();
             const filtered = sites.filter(s => s.n.includes(search) || s.ip.includes(search));
 
-            // TAB: CAÍDOS
             document.getElementById('map-offline').innerHTML = filtered.filter(s => s.status === 'offline').map(s => {
-                let note = "", buttons = "";
                 const base = s.ip.split('.').slice(0,3).join('.');
-                const timeStr = getDowntime(s.offlineSince);
-
-                if (s.diag === 'CRITICAL') {
-                    note = `<div class="bg-red-900/30 p-2 rounded border border-red-500/50 text-[10px] text-red-200 mt-2 font-bold uppercase text-center">SOLICITAR VALIDAR CON EL COMPLEJO</div>`;
-                } else if (s.diag === 'REACHABLE') {
-                    note = `<div class="bg-yellow-900/30 p-2 rounded border border-yellow-500/50 text-[10px] text-yellow-200 mt-2 font-bold uppercase text-center">ENCENDER POR MÁQUINA VIRTUAL O ILO</div>`;
-                    if (s.virt_ok) buttons += `<a href="http://${base}.22" target="_blank" class="bg-blue-600 text-center py-1 rounded text-white font-bold text-[10px]">VIRTUAL</a>`;
-                    if (s.ilo_ok) buttons += `<a href="https://${base}.21" target="_blank" class="bg-orange-600 text-center py-1 rounded text-white font-bold text-[10px]">ILO</a>`;
-                } else {
-                    note = `<div class="bg-gray-800 p-2 rounded border border-gray-600 text-[10px] text-gray-400 mt-2 italic text-center">SIN RESPUESTA DE SERVICIOS</div>`;
-                }
-
+                let note = s.diag === 'CRITICAL' ? 
+                    '<div class="text-red-400 text-[10px] mt-2 font-bold uppercase">❗ VALIDAR CON COMPLEJO</div>' : 
+                    '<div class="text-yellow-400 text-[10px] mt-2 font-bold uppercase">💡 ENCENDER POR VIRTUAL/ILO</div>';
+                
                 return `
                 <div class="card-critica p-4 rounded-lg shadow-xl relative">
-                    <div class="absolute top-2 right-2 text-[9px] font-bold text-red-400 bg-red-900/20 px-2 py-0.5 rounded">Fuera hace: ${timeStr}</div>
-                    <div class="flex justify-between font-bold text-red-500 text-xs mb-2 uppercase"><span>${s.n}</span></div>
-                    <p class="text-[9px] text-gray-500 font-mono italic">IP: ${s.ip} | FORTI: ${s.f}</p>
+                    <div class="absolute top-2 right-2 text-[9px] text-red-400 font-bold">FUERA: ${getDowntime(s.offlineSince)}</div>
+                    <div class="font-bold text-red-500 text-xs mb-1">${s.n}</div>
+                    <div class="text-[9px] text-gray-500 mb-2">IP: ${s.ip} | FORTI: ${s.f}</div>
                     ${note}
-                    <div class="grid grid-cols-2 gap-2 mt-3">${buttons}</div>
+                    <div class="grid grid-cols-2 gap-2 mt-3">
+                        ${s.virt_ok ? `<a href="http://${base}.22" target="_blank" class="bg-blue-600 text-center py-1 rounded text-[10px] font-bold">VIRTUAL</a>` : ''}
+                        ${s.ilo_ok ? `<a href="https://${base}.21" target="_blank" class="bg-orange-600 text-center py-1 rounded text-[10px] font-bold">iLO</a>` : ''}
+                    </div>
                 </div>`;
             }).join('');
 
-            // TAB: TODOS & ONLINE
             document.getElementById('map-all').innerHTML = filtered.map(s => `
                 <div class="bg-gray-900/50 p-2 rounded border border-gray-800 flex items-center gap-2 text-[10px]">
-                    <span class="dot ${s.status === 'online' ? 'bg-green-500' : s.status === 'offline' ? 'bg-red-500' : 'bg-gray-600'}"></span>
-                    <div class="flex flex-col">
+                    <span class="dot ${s.status === 'online' ? 'bg-green-500 shadow-[0_0_5px_green]' : s.status === 'offline' ? 'bg-red-500 shadow-[0_0_5px_red]' : 'bg-gray-600'}"></span>
+                    <div class="flex flex-col truncate">
                         <span class="truncate">${s.n}</span>
-                        ${s.status === 'offline' ? `<span class="text-[8px] text-red-400">Offline: ${getDowntime(s.offlineSince)}</span>` : ''}
+                        ${s.status === 'offline' ? `<span class="text-[8px] text-red-500">${getDowntime(s.offlineSince)}</span>` : ''}
                     </div>
                 </div>
             `).join('');
