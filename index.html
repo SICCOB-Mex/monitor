@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Ultra Monitor IT - Cascada & Downtime</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 10px;
+        }
+        .dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; transition: background 0.4s; }
+        .tab-active { border-bottom: 3px solid #3b82f6; color: #3b82f6; font-weight: bold; }
+        .card-critica { border-left: 4px solid #ef4444; background: #161b22; transition: all 0.3s; }
+        #timer-display { font-variant-numeric: tabular-nums; }
+    </style>
+</head>
+<body class="bg-[#0b0e14] text-gray-300 p-5">
+
+    <div class="flex justify-between items-center border-b border-gray-700 pb-4 mb-6">
+        <div>
+            <h1 class="text-2xl font-bold text-white flex items-center gap-3">
+                📡 Monitor de Red 
+                <span id="global-count" class="bg-blue-900 text-blue-300 text-xs px-2 py-1 rounded">0 Sites</span>
+            </h1>
+            <p class="text-[10px] text-gray-500 mt-1 uppercase tracking-widest">Siguiente escaneo en: <span id="timer-display" class="text-blue-400 font-bold">01:00</span></p>
+        </div>
+        <div class="flex gap-4">
+            <input type="text" id="search" placeholder="Buscar sitio o IP..." class="bg-gray-800 border border-gray-700 rounded px-4 py-2 text-sm focus:outline-none focus:border-blue-500 w-64">
+            <button onclick="startMonitor()" id="btnAction" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-bold text-sm transition-all shadow-lg">▶ INICIAR ESCANEO</button>
+        </div>
+    </div>
+
+    <div class="flex gap-8 mb-6 border-b border-gray-800 text-sm">
+        <button onclick="switchTab('all')" id="tab-all" class="pb-2 px-1 tab-active transition-all">TODOS (<span id="count-all">0</span>)</button>
+        <button onclick="switchTab('online')" id="tab-online" class="pb-2 px-1 text-gray-500 hover:text-gray-300 transition-all">EN LÍNEA (<span id="count-online">0</span>)</button>
+        <button onclick="switchTab('offline')" id="tab-offline" class="pb-2 px-1 text-gray-500 hover:text-gray-300 transition-all font-bold text-red-500">CAÍDOS (<span id="count-offline">0</span>)</button>
+    </div>
+
+    <div id="view-all" class="tab-content">
+        <div id="map-all" class="status-grid bg-gray-900/10 p-4 rounded-lg border border-gray-800"></div>
+    </div>
+
+    <div id="view-online" class="tab-content hidden">
+        <div id="map-online" class="status-grid bg-green-900/10 p-4 rounded-lg border border-green-900/30"></div>
+    </div>
+
+    <div id="view-offline" class="tab-content hidden">
+        <div id="map-offline" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"></div>
+    </div>
+
+    <script>
+        let sites = [];
+        let isRunning = false;
+        let currentTab = 'all';
+        let countdown = 60;
+        let timerInterval = null;
+
+        // 1. Carga Inicial
+        async function loadData() {
+            const localData = localStorage.getItem('monitor_v5_final');
+            if (localData) {
+                sites = JSON.parse(localData);
+            } else {
+                try {
+                    const response = await fetch('data.json');
+                    const data = await response.json();
+                    sites = data.map(s => ({
+                        ...s,
+                        status: 'unknown',
+                        diag: 'none',
+                        offlineSince: null
+                    }));
+                    saveToLocal();
+                } catch(e) { console.error("Error cargando data.json"); }
+            }
+            updateCounters();
+            renderAll();
+        }
+
+        function saveToLocal() { localStorage.setItem('monitor_v5_final', JSON.stringify(sites)); }
+
+        // 2. Método de Sonda (Probe) Real para Navegador
+        function probeIP(ip) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                const start = Date.now();
+                const timer = setTimeout(() => {
+                    img.src = "";
+                    resolve(false); 
+                }, 2000); 
+
+                img.onload = () => { clearTimeout(timer); resolve(true); };
+                img.onerror = () => { 
+                    clearTimeout(timer);
+                    const duration = Date.now() - start;
+                    resolve(duration < 2000); 
+                };
+                img.src = `http://${ip}/favicon.ico?t=${Date.now()}`;
+            });
+        }
+
+        // 3. Lógica de Escaneo en Cascada
+        async function runCycle() {
+            if (!isRunning) return;
+            
+            const batchSize = 15;
+            for (let i = 0; i < sites.length; i += batchSize) {
+                const batch = sites.slice(i, i + batchSize);
+                await Promise.all(batch.map(async (site, idx) => {
+                    const gIdx = i + idx;
+                    
+                    // PASO 1: Validar Fortinet (.1)
+                    const fortiOk = await probeIP(site.f);
+                    if (!fortiOk) {
+                        setOffline(gIdx, 'CRITICAL');
+                        return;
+                    }
+
+                    // PASO 2: Validar Servidor Principal (.20/.30)
+                    const serverOk = await probeIP(site.ip);
+                    if (serverOk) {
+                        sites[gIdx].status = 'online';
+                        sites[gIdx].offlineSince = null;
+                        sites[gIdx].diag = 'OK';
+                        return;
+                    }
+
+                    // PASO 3: Forti vive, Server no -> Validar iLO (.21) / Virtual (.22)
+                    setOffline(gIdx, 'REACHABLE');
+                    const base = site.ip.split('.').slice(0,3).join('.');
+                    const [ilo, virt] = await Promise.all([probeIP(`${base}.21`), probeIP(`${base}.22`)]);
+                    sites[gIdx].ilo_ok = ilo;
+                    sites[gIdx].virt_ok = virt;
+                    if (!ilo && !virt) sites[gIdx].diag = 'DEAD';
+                }));
+                renderAll();
+            }
+            updateCounters();
+            resetTimer();
+        }
+
+        function setOffline(index, diagnostic) {
+            sites[index].status = 'offline';
+            sites[index].diag = diagnostic;
+            if (!sites[index].offlineSince) sites[index].offlineSince = Date.now();
+        }
+
+        function getDowntime(since) {
+            if (!since) return "";
+            const diff = Math.floor((Date.now() - since) / 1000);
+            return `${Math.floor(diff / 60)}m ${diff % 60}s`;
+        }
+
+        function resetTimer() {
+            countdown = 60;
+            if (timerInterval) clearInterval(timerInterval);
+            timerInterval = setInterval(() => {
+                countdown--;
+                const mins = String(Math.floor(countdown / 60)).padStart(2, '0');
+                const secs = String(countdown % 60).padStart(2, '0');
+                document.getElementById('timer-display').innerText = `${mins}:${secs}`;
+                if (countdown <= 0) {
+                    clearInterval(timerInterval);
+                    runCycle();
+                }
+            }, 1000);
+        }
+
+        function startMonitor() {
+            if (isRunning) return location.reload();
+            isRunning = true;
+            document.getElementById('btnAction').innerText = "🛑 DETENER";
+            document.getElementById('btnAction').classList.replace('bg-blue-600', 'bg-red-600');
+            runCycle();
+        }
+
+        function renderAll() {
+            const searchTerm = document.getElementById('search').value.toUpperCase();
+            const filtered = sites.filter(s => s.n.includes(searchTerm) || s.ip.includes(searchTerm));
+
+            // TAB: TODOS
+            document.getElementById('map-all').innerHTML = filtered.map((s, i) => `
+                <div class="flex justify-between items-center bg-gray-800 p-2 rounded border border-gray-700 text-[10px]">
+                    <div class="flex items-center gap-2 truncate">
+                        <span class="dot ${s.status === 'online' ? 'bg-green-500 shadow-[0_0_5px_green]' : s.status === 'offline' ? 'bg-red-500 shadow-[0_0_5px_red]' : 'bg-gray-600'}"></span>
+                        <div class="flex flex-col truncate">
+                            <span class="truncate">${s.n}</span>
+                            ${s.status === 'offline' ? `<span class="text-[8px] text-red-400">${getDowntime(s.offlineSince)}</span>` : ''}
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+
+            // TAB: EN LÍNEA
+            document.getElementById('map-online').innerHTML = filtered.filter(s => s.status === 'online').map(s => `
+                <div class="flex items-center gap-2 bg-green-900/10 p-2 rounded border border-green-800/20 text-[10px]">
+                    <span class="dot bg-green-500"></span>
+                    <span class="truncate text-green-400 font-bold">${s.n}</span>
+                </div>
+            `).join('');
+
+            // TAB: CAÍDOS (CON NOTAS TÉCNICAS)
+            document.getElementById('map-offline').innerHTML = filtered.filter(s => s.status === 'offline').map(s => {
+                const base = s.ip.split('.').slice(0,3).join('.');
+                let note = "", buttons = "";
+
+                if (s.diag === 'CRITICAL') {
+                    note = `<div class="bg-red-900/30 p-2 rounded border border-red-500/50 text-[10px] text-red-200 mt-2 font-bold uppercase text-center italic">Solicitar validar con el complejo</div>`;
+                } else if (s.diag === 'REACHABLE') {
+                    note = `<div class="bg-yellow-900/30 p-2 rounded border border-yellow-500/50 text-[10px] text-yellow-200 mt-2 font-bold uppercase text-center italic">Encender por máquina virtual o iLO</div>`;
+                    if (s.virt_ok) buttons += `<a href="http://${base}.22" target="_blank" class="bg-blue-600 hover:bg-blue-500 text-center py-2 rounded text-white font-bold text-[10px]">VIRTUAL</a>`;
+                    if (s.ilo_ok) buttons += `<a href="https://${base}.21" target="_blank" class="bg-orange-600 hover:bg-orange-500 text-center py-2 rounded text-white font-bold text-[10px]">iLO</a>`;
+                } else {
+                    note = `<div class="bg-gray-800 p-2 rounded border border-gray-600 text-[10px] text-gray-400 mt-2 italic text-center uppercase">Sin respuesta de red tras Fortinet</div>`;
+                }
+
+                return `
+                <div class="card-critica p-4 rounded-lg shadow-xl relative">
+                    <div class="absolute top-2 right-2 text-[9px] text-red-400 font-bold">OFFLINE: ${getDowntime(s.offlineSince)}</div>
+                    <div class="font-bold text-red-500 text-xs mb-1 uppercase">${s.n}</div>
+                    <div class="text-[9px] text-gray-500 mb-2 font-mono">IP: ${s.ip} | FORTI: ${s.f}</div>
+                    ${note}
+                    <div class="grid grid-cols-2 gap-2 mt-3">${buttons}</div>
+                </div>`;
+            }).join('');
+        }
+
+        function switchTab(tab) {
+            currentTab = tab;
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+            document.querySelectorAll('button[id^="tab-"]').forEach(b => b.classList.remove('tab-active', 'text-gray-300'));
+            document.getElementById(`view-${tab}`).classList.remove('hidden');
+            document.getElementById(`tab-${tab}`).classList.add('tab-active');
+            renderAll();
+        }
+
+        function updateCounters() {
+            const online = sites.filter(s => s.status === 'online').length;
+            const offline = sites.filter(s => s.status === 'offline').length;
+            document.getElementById('global-count').innerText = `${sites.length} Sites`;
+            document.getElementById('count-all').innerText = sites.length;
+            document.getElementById('count-online').innerText = online;
+            document.getElementById('count-offline').innerText = offline;
+        }
+
+        document.getElementById('search').addEventListener('input', renderAll);
+        window.onload = loadData;
+    </script>
+</body>
+</html>
